@@ -37,6 +37,13 @@ def split_author_names(author_text: str) -> List[str]:
     normalized = normalized.replace("&", " and ")
     normalized = re.sub(r"\s+and\s+", ";", normalized, flags=re.IGNORECASE)
 
+    surname_initial_matches = re.findall(
+        r"([^,;]+),\s*(?:[A-Z]\.?\s*)+(?=,|;|$)",
+        normalized,
+    )
+    if len(surname_initial_matches) >= 2:
+        return [match.strip(" .,") for match in surname_initial_matches if match.strip(" .,")]
+
     # APA citations use commas inside individual names, so semicolons are safer.
     if ";" in normalized:
         parts = [part.strip(" .,") for part in normalized.split(";")]
@@ -144,6 +151,77 @@ def normalize_author_string(value: Optional[str]) -> str:
     return " ".join(tokens)
 
 
+def author_surname_candidates(author_text: str) -> List[str]:
+    """Extract surname-like candidates from common author citation formats."""
+    if not author_text:
+        return []
+
+    text = re.sub(r"\bet\s+al\.?", "", author_text, flags=re.IGNORECASE)
+    text = text.replace("&", " and ")
+
+    # Handles "Budinis, S., Krevor, S., Mac Dowell, N."
+    surname_initial_matches = re.findall(
+        r"([^,;]+),\s*(?:[A-Z]\.?\s*)+(?=,|;|$)",
+        text,
+    )
+    if surname_initial_matches:
+        raw_names = surname_initial_matches
+    else:
+        raw_names = re.split(r"\s+and\s+|;", text, flags=re.IGNORECASE)
+        if len(raw_names) == 1 and "," in text:
+            raw_names = text.split(",")
+
+    candidates = []
+    seen = set()
+    surname_particles = {
+        "da",
+        "de",
+        "del",
+        "der",
+        "di",
+        "du",
+        "la",
+        "le",
+        "mac",
+        "mc",
+        "van",
+        "von",
+    }
+
+    for raw_name in raw_names:
+        normalized = normalize_author_string(raw_name)
+        tokens = normalized.split()
+        if not tokens:
+            continue
+
+        surname = tokens[-1]
+        if len(tokens) >= 2 and tokens[-2] in surname_particles:
+            surname = f"{tokens[-2]} {surname}"
+
+        if len(surname) > 1 and surname not in seen:
+            candidates.append(surname)
+            seen.add(surname)
+
+    return candidates
+
+
+def surname_coverage_percent(user_authors: str, official_authors: str) -> float:
+    """Score how many user-provided surnames appear in the official author list."""
+    user_surnames = author_surname_candidates(user_authors)
+    official_text = normalize_author_string(official_authors)
+    if not user_surnames:
+        return 0.0
+    if not official_text:
+        return 0.0
+
+    matched = sum(
+        1
+        for surname in user_surnames
+        if re.search(rf"\b{re.escape(surname)}\b", official_text)
+    )
+    return (matched / len(user_surnames)) * 100
+
+
 def similarity_percent(left: Optional[str], right: Optional[str]) -> float:
     """Return a Levenshtein ratio as a 0-100 percentage."""
     left_norm = normalize_for_matching(left)
@@ -156,7 +234,7 @@ def similarity_percent(left: Optional[str], right: Optional[str]) -> float:
 
 
 def author_similarity_percent(user_authors: str, official_authors: str) -> float:
-    """Compare authors using both sequence order and token-sorted names."""
+    """Compare authors using raw text similarity and surname coverage."""
     left = normalize_author_string(user_authors)
     right = normalize_author_string(official_authors)
     if not left and not right:
@@ -168,7 +246,19 @@ def author_similarity_percent(user_authors: str, official_authors: str) -> float
     sorted_left = " ".join(sorted(left.split()))
     sorted_right = " ".join(sorted(right.split()))
     token_sorted = levenshtein_ratio(sorted_left, sorted_right) * 100
-    return max(ordered, token_sorted)
+    surname_coverage = surname_coverage_percent(user_authors, official_authors)
+    return max(ordered, token_sorted, surname_coverage)
+
+
+def doi_similarity_percent(user_doi: Optional[str], official_doi: Optional[str]) -> Optional[float]:
+    """Return DOI agreement when the user supplied a DOI; otherwise skip the field."""
+    if not user_doi:
+        return None
+    if not official_doi:
+        return 0.0
+    user_norm = normalize_for_matching(user_doi)
+    official_norm = normalize_for_matching(official_doi)
+    return 100.0 if user_norm == official_norm else 0.0
 
 
 def request_with_backoff(
@@ -314,12 +404,18 @@ def score_candidate(parsed: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[s
     user_title = parsed.get("Title") or ""
     user_authors = ", ".join(parsed.get("Authors") or []) or parsed.get("raw_author_text", "")
     user_year = parsed.get("Year") or ""
+    user_doi = parsed.get("DOI") or ""
 
     title_score = similarity_percent(user_title, candidate.get("title"))
     author_score = author_similarity_percent(user_authors, candidate.get("authors", ""))
     year_score = 100.0 if user_year and user_year == str(candidate.get("year", "")) else 0.0
+    doi_score = doi_similarity_percent(user_doi, candidate.get("doi"))
 
-    base_score = (title_score + author_score + year_score) / 3
+    score_fields = [title_score, author_score, year_score]
+    if doi_score is not None:
+        score_fields.append(doi_score)
+
+    base_score = sum(score_fields) / len(score_fields)
     chimeric_penalty = title_score > 80 and author_score < 90
     final_score = max(0.0, base_score - 25.0) if chimeric_penalty else base_score
 
@@ -328,6 +424,7 @@ def score_candidate(parsed: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[s
         "title_score": round(title_score, 1),
         "author_score": round(author_score, 1),
         "year_score": round(year_score, 1),
+        "doi_score": round(doi_score, 1) if doi_score is not None else "Not supplied",
         "base_score": round(base_score, 1),
         "chimeric_penalty": chimeric_penalty,
         "final_score": round(final_score, 1),
@@ -401,6 +498,18 @@ st.set_page_config(
 
 st.title("Citation Hallucination Detector")
 st.caption("Deterministic existence-only metadata verification for generated academic citations.")
+with st.expander("Recommended citation input format", expanded=False):
+    st.write(
+        "For best results, paste one complete citation containing a title, authors, year, "
+        "and DOI when available. The app now handles common surname-initial and full-name "
+        "author formats, but clean citation text still produces the most reliable parsing."
+    )
+    st.code(
+        "Budinis, S., Krevor, S., Mac Dowell, N., Brandon, N., & Hawkes, A. "
+        "(2018). An assessment of CCS costs, barriers and potential. "
+        "Energy Strategy Reviews. https://doi.org/10.1016/j.esr.2018.08.003",
+        language="text",
+    )
 
 with st.sidebar:
     st.header("API Settings")
@@ -483,6 +592,7 @@ if verify_clicked:
                     "Title": best_candidate["title_score"],
                     "Authors": best_candidate["author_score"],
                     "Year": best_candidate["year_score"],
+                    "DOI": best_candidate["doi_score"],
                     "Base Confidence": best_candidate["base_score"],
                     "Chimeric Penalty": "Yes" if best_candidate["chimeric_penalty"] else "No",
                     "Final Confidence": best_candidate["final_score"],
